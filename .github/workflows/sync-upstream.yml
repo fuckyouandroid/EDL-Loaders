@@ -1,0 +1,107 @@
+name: Sync upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-${{ github.repository }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync fork with upstream
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure Git
+        shell: bash
+        run: |
+          set -e
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Detect upstream repository
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+
+          REPO_INFO="$(gh api "repos/${GITHUB_REPOSITORY}")"
+
+          IS_FORK="$(echo "$REPO_INFO" | jq -r '.fork')"
+
+          if [ "$IS_FORK" != "true" ]; then
+            echo "This repository is not a fork. Nothing to sync."
+            echo "SHOULD_SYNC=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          UPSTREAM_CLONE_URL="$(echo "$REPO_INFO" | jq -r '.parent.clone_url')"
+          UPSTREAM_FULL_NAME="$(echo "$REPO_INFO" | jq -r '.parent.full_name')"
+          UPSTREAM_DEFAULT_BRANCH="$(echo "$REPO_INFO" | jq -r '.parent.default_branch')"
+
+          echo "Detected upstream: $UPSTREAM_FULL_NAME"
+          echo "Upstream URL: $UPSTREAM_CLONE_URL"
+          echo "Upstream default branch: $UPSTREAM_DEFAULT_BRANCH"
+
+          echo "SHOULD_SYNC=true" >> "$GITHUB_ENV"
+          echo "UPSTREAM_CLONE_URL=$UPSTREAM_CLONE_URL" >> "$GITHUB_ENV"
+          echo "UPSTREAM_DEFAULT_BRANCH=$UPSTREAM_DEFAULT_BRANCH" >> "$GITHUB_ENV"
+
+      - name: Sync branch
+        if: env.SHOULD_SYNC == 'true'
+        shell: bash
+        run: |
+          set -e
+
+          CURRENT_BRANCH="${GITHUB_REF_NAME}"
+
+          echo "Current branch: $CURRENT_BRANCH"
+
+          git remote add upstream "$UPSTREAM_CLONE_URL" || git remote set-url upstream "$UPSTREAM_CLONE_URL"
+          git fetch origin "$CURRENT_BRANCH"
+          git fetch upstream --prune
+
+          git checkout "$CURRENT_BRANCH"
+
+          if git show-ref --verify --quiet "refs/remotes/upstream/$CURRENT_BRANCH"; then
+            UPSTREAM_BRANCH="$CURRENT_BRANCH"
+          else
+            UPSTREAM_BRANCH="$UPSTREAM_DEFAULT_BRANCH"
+          fi
+
+          echo "Using upstream branch: $UPSTREAM_BRANCH"
+
+          LOCAL_COMMIT="$(git rev-parse HEAD)"
+          UPSTREAM_COMMIT="$(git rev-parse "upstream/$UPSTREAM_BRANCH")"
+
+          echo "Local commit: $LOCAL_COMMIT"
+          echo "Upstream commit: $UPSTREAM_COMMIT"
+
+          if [ "$LOCAL_COMMIT" = "$UPSTREAM_COMMIT" ]; then
+            echo "Already up to date."
+            exit 0
+          fi
+
+          if git merge-base --is-ancestor HEAD "upstream/$UPSTREAM_BRANCH"; then
+            echo "Fast-forwarding branch..."
+            git merge --ff-only "upstream/$UPSTREAM_BRANCH"
+          else
+            echo "Branch has local changes. Merging upstream..."
+            git merge --no-edit "upstream/$UPSTREAM_BRANCH"
+          fi
+
+          git push origin "$CURRENT_BRANCH"
